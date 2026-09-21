@@ -1,0 +1,9 @@
+# 统一换行：仓库里一律存 LF，避免 Windows / Linux 之间满屏假 diff
+* text=auto eol=lf
+
+# 二进制文件不做任何转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.nc   binary
+*.spe  binary

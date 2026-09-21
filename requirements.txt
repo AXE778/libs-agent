@@ -1,0 +1,37 @@
+# ===== 大模型接入 =====
+# 用 OpenAI 官方 SDK 做「通用客户端」：豆包(火山方舟)和 Kimi(Moonshot)
+# 都是 OpenAI 兼容接口，所以一套代码 + 换 base_url 就能调两家。
+# 换厂商只需改 .env 里的 LLM_PROVIDER，代码不用动。
+openai>=1.40
+
+# 【备选，默认不用装】火山方舟官方 SDK。
+# 它的导入名是 volcenginesdkarkruntime，接口和 openai 一样，属于「专用版」。
+# 注意：这个包把火山云所有服务所有历史版本的 SDK 都打包了（2.3 万+ 小文件、
+#      装一次要 1 小时以上）。除非要用方舟独有功能，否则没必要装。
+# 老教程里的 volcengine-python-sdk[ark] 写法在 5.x 已失效（没有 ark 这个 extra）。
+# volcengine-python-sdk>=5.0.0
+
+# 注意：方舟 SDK 的元数据不完整，没有把它自己的依赖 httpx 声明出来，
+# 不单独装会在 import 时报 No module named 'httpx'（实测踩过）。
+# 用 openai SDK 则无此问题，这里留着以防切回方舟 SDK。
+httpx>=0.27
+
+# ===== 读 .env 配置 =====
+python-dotenv>=1.0.1
+
+# ===== 光谱数据处理（Step 3 开始用）=====
+numpy>=1.26
+pandas>=2.2
+scipy>=1.13
+
+# ===== 出图（Step 3 起，用来肉眼验证「读进来的谱长什么样」）=====
+# 只在 step3_demo.py 里用；没装也能跑，只是不生成图。
+matplotlib>=3.8
+
+# ===== Step 10 做 FastAPI 后端时才用得上，先装好省得回头补 =====
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.8
+
+# ===== 备用：不想用官方 SDK 时可以直接打 HTTP =====
+requests>=2.32.0
