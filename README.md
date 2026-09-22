@@ -206,8 +206,7 @@ python main.py "有哪些数据"
 libs_agent/
 ├── main.py                     # 命令行入口（问一句就退出 / 连续对话）
 ├── scripts/
-│   ├── selfcheck.py            # 离线自检：不联网、不花钱，验证工具链是否通
-│   └── export_public.py        # 从完整版导出可公开版（路径脱敏 + 生成合成数据）
+│   └── selfcheck.py            # 离线自检：不联网、不花钱，验证工具链是否通
 ├── server/app.py               # FastAPI 后端：/health /tools /chat /sessions
 ├── agent/                      # 「理解与决策」层 —— 只这一层碰大模型
 │   ├── llm_client.py           # 通用客户端（豆包 / Kimi / 商汤，换厂商只改 .env）
