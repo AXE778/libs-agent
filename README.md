@@ -279,9 +279,33 @@ Python 3.13（3.10+ 应该也行），主要依赖：`openai`、`numpy`、`panda
 
 - [x] 真实光谱读取 + 质量检查 + 元素匹配 + 报告 + 预处理
 - [x] 工具调用 / Agent 主循环 / FastAPI 后端
-- [ ] Qt 上位机聊天窗口（走 HTTP 调后端）
+- [x] Qt 上位机聊天窗口（走 HTTP 调后端，不 import Python）
 - [ ] 二维元素强度成像
 - [ ] 自适应稀疏采样与重建
+
+---
+
+## 上位机客户端（`client_qt/`）
+
+C++17 + Qt（Widgets + Network）+ CMake，**不 import 任何 Python** ——
+两个进程、两种语言，靠 JSON over HTTP 说话。数字仍然全部由 `tools/` 里的 Python 算出来，
+客户端不做算术、不判合格与否。
+
+```bat
+cd client_qt
+_deploy.bat                        :: 编译 + windeployqt 打包到 dist\
+dist\libs_agent_client.exe         :: 开窗口（默认连 127.0.0.1:8000）
+```
+
+调试用的两条通道（打包后是 GUI 子系统程序，没有控制台，这两条尤其重要）：
+
+```bat
+dist\libs_agent_client.exe --selftest          :: 无界面自检，只查 /health，不打大模型
+dist\libs_agent_client.exe --demo "问题"        :: 开窗口并自动提问（做演示截图用）
+dist\libs_agent_client.exe --log D:\tmp\c.log  :: 界面状态与问答落盘
+```
+
+工具链不在默认位置时设 `LIBS_VS_DIR` / `LIBS_QT_DIR`。细节见 `client_qt/README.md`。
 
 ---
 
