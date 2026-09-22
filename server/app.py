@@ -287,7 +287,7 @@ q.addEventListener('keydown',function(e){ if(e.ctrlKey&&e.key==='Enter'){documen
 def create_app(store: SessionStore | None = None) -> FastAPI:
     """建一个应用实例。
 
-    做成工厂函数是为了测试：`step10_demo.py` 每次都能拿到一个干净的会话表，
+    做成工厂函数是为了测试：`demos/step10_demo.py` 每次都能拿到一个干净的会话表，
     不会被上一次测试留下的会话干扰。
     """
     api = FastAPI(
