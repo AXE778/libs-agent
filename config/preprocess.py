@@ -26,7 +26,31 @@ config.preprocess —— 预处理流水线的全部默认参数与可选方法�
 两组数据的波长上限不同（不锈钢那套到 954 nm，快速采集那套只到 812 nm）。
 统一到同一个轴上时，超出一条谱自身覆盖范围的格点**一个都不生成**，
 既不用 NaN、也不重复端点值。理由见 tools/preprocess.py 里 _uniform_axis 的注释。
-"""
+
+============ 与 <上位机软件>（用户那套工业上位机）的关系（2026-09-22 对照）============
+对照了 <LIBS 软件安装目录> 的预处理源码。结论一句话：
+**算法全部对齐，顺序故意不同。**
+
+取它有的（因为那套软件就是现场在跑的东西，结果要和它对得上）：
+  · 基线 **airPLS**（Zhang et al. 2010）—— 它的「基线校正」下拉框就两项 airPLS/als，
+    而且默认项就是 airPLS（λ=1000、阶数=2）。见 tools/preprocess.py 的 _airpls_baseline；
+  · 基线 ALS 的**差分阶数**参数 —— 它的 als(data, lam, d, p, niter) 是公开 d 的；
+  · 平滑 **Whittaker**（Eilers 2003 "A perfect smoother"）—— 它的 wt_deNoise。
+    （它的平滑是 SG / WT / EMD，SG 我们本来就有；EMD 要额外依赖，没取。）
+
+不取它的（都是有意为之，理由在下面）：
+  · **执行顺序**。<上位机软件> 是「基线 → 插值 → 平滑」。我们是「插值 → 基线 → 平滑」，
+    理由见上面第 1 条：ALS/airPLS 的 λ 惩罚的是**相邻采样点的差分**，
+    所以同一个 λ 在 0.065 nm 网格和 0.142 nm 网格上的物理平滑宽度完全不同。
+    本机步长随波长从 0.065 变到 0.142 nm，若先基线后插值，λ 对每条谱的含义都不同、
+    跨谱不可比 —— 这与本文件「平滑窗口用 nm 给、而不是给点数」是同一条道理。
+    （代价：λ 的绝对值与 <上位机软件> 面板上填的那个数不能直接互抄，需按本网格重标定。）
+  · 它的 polynomial.py：全局 polyfit，峰会把拟合线整个拽上去。
+    我们保留自己的迭代 σ 剔除版（_poly_baseline）。
+  · 它的 MSC / SNV / max_min：MSC 需要"一组谱的平均谱"当参考，
+    是批处理概念而不是单谱变换；SNV 与 standardization 两份实现**逐字节相同**
+    （同一个公式抄了两遍），我们没跟着抄这份重复。
+    （归一化我们给的是 max / area / line，语义见下。）"""
 
 from __future__ import annotations
 
@@ -36,28 +60,36 @@ from config.quality import ADC_CEILING, NEAR_SATURATION_RATIO
 
 __all__ = [
     "INTERP_MODES", "BASELINE_METHODS", "SMOOTH_METHODS", "NORMALIZE_MODES",
-    "DEFAULT_GRID_STEP_NM", "MIN_GRID_STEP_NM", "MAX_GRID_POINTS",
+    "MIN_GRID_STEP_NM", "MAX_GRID_POINTS",
     "SMOOTH_WINDOW_NM", "SMOOTH_WINDOW_CANDIDATES_NM", "SMOOTH_MAX_PEAK_CHANGE_PCT",
     "SMOOTH_MIN_WINDOW_POINTS", "MIN_SMOOTH_WINDOW_NM", "SMOOTH_POLYORDER",
-    "ALS_LAMBDA", "ALS_P", "ALS_NITER",
+    "ALS_LAMBDA", "ALS_P", "ALS_NITER", "ALS_ORDER",
+    "AIRPLS_LAMBDA", "AIRPLS_ORDER", "AIRPLS_NITER", "AIRPLS_TOL",
     "POLY_ORDER", "POLY_NITER", "POLY_SIGMA",
+    "WHITTAKER_LAMBDA", "WHITTAKER_ORDER", "WHITTAKER_LAMBDA_CANDIDATES",
     "NORM_LINE_WINDOW_NM", "PREPROCESS_DIRNAME",
     "PIPELINE_ORDER", "ADC_CEILING", "NEAR_SATURATION_RATIO",
 ]
 
 # ---------------------------------------------------------------- 方法可选值
 INTERP_MODES = ("none", "uniform", "common")
-BASELINE_METHODS = ("none", "als", "poly")
-SMOOTH_METHODS = ("none", "savgol", "moving")
+BASELINE_METHODS = ("none", "als", "airpls", "poly")
+SMOOTH_METHODS = ("none", "savgol", "moving", "whittaker")
 NORMALIZE_MODES = ("none", "max", "area", "line")
 
 # 方法的固定执行顺序（代码里按这个顺序跑，不由调用方指定）
 PIPELINE_ORDER = ("interpolate", "baseline", "smooth", "normalize")
 
 # ------------------------------------------------------------------ 插值/网格
-# 统一轴的默认步长。0.05 nm 比仪器本来的中位步长（0.0999 nm）更细，
-# 属于"上采样"：只让曲线更平滑，不凭空造出新信息 —— 但不能据此声称分辨率提高了。
-DEFAULT_GRID_STEP_NM = 0.05
+# ★ 这里**故意没有**「默认步长」常量 —— 默认步长是**每条谱自己的中位步长**
+#   （≈ 一个探测器像素的色散；本机不锈钢数据约 0.102 nm），由
+#   tools/preprocess.py 的 _median_step() 现算；interpolate="common" 时
+#   取所有谱里**最粗**的那条的中位步长。这样「重采样」只是换个采样点，
+#   不凭空造出新信息。
+#   （历史上这里曾有 DEFAULT_GRID_STEP_NM = 0.05，但代码从来没引用过它，
+#     留着会让人误以为默认步长是 0.05 nm —— 2026-09-22 删除。）
+#   想指定步长就传 grid_step_nm（下限 MIN_GRID_STEP_NM）；担心最密波段丢细节时
+#   设到最密步长附近（不锈钢约 0.065 nm、快速采集约 0.043 nm）。
 MIN_GRID_STEP_NM = 0.005      # 比这更细没有意义，只会白烧内存
 MAX_GRID_POINTS = 120_000     # 单条谱插值后的点数上限（防护，正常用不到）
 
@@ -97,11 +129,47 @@ SMOOTH_POLYORDER = 2             # SG 多项式阶数；2 阶保峰形，3 阶�
 ALS_LAMBDA = 1.0e5
 ALS_P = 0.01
 ALS_NITER = 10
+ALS_ORDER = 2                 # 惩罚的差分阶数 d（1=斜率, 2=曲率）。<上位机软件> 的 als(..., d) 也公开它
+# ⚠ λ 的绝对值绑定网格步长：它惩罚的是相邻采样点的差分，所以 1e5 只有在
+#   「步长 ≈ 0.1 nm 的均匀网格」上才是现在这个效果。改 grid_step_nm 要重标定。
+
+# ------------------------------------------------------------ airPLS 基线
+# ★ 来源：<LIBS 软件安装目录>\Algorithm\deBase\airPLS.py
+#   用户那套工业上位机的「基线校正」下拉框只有 airPLS / als 两项，
+#   且 init_status() 里默认值就是 airPLS + λ=1000 + 阶数=2 —— 所以这是现场默认算法。
+#   算法出处：Zhang, Chen & Liang, "Baseline correction using adaptive iteratively
+#   reweighted penalized least squares", Analyst 135 (2010) 1138.
+#
+# 与 ALS 的区别只有**权重更新规则**（其余：同一个 Whittaker 惩罚最小二乘内核）：
+#     ALS    ：w = p 或 1-p —— 固定两档，峰点权重 p=0.01
+#     airPLS ：w = exp(i·|d⁻|/Σ|d⁻|) —— 逐轮指数加重；峰点(d≥0)权重直接置 0
+#   后果：airPLS 更"敢"把峰完全忽略，收敛也更快（本机真实谱实测 4~5 轮就触发停机）。
+AIRPLS_LAMBDA = 1.0e3         # 与 <上位机软件> 上位机默认一致
+AIRPLS_ORDER = 2              # 惩罚二阶差分
+AIRPLS_NITER = 15             # 与 <上位机软件> 的 itermax 默认一致
+AIRPLS_TOL = 1.0e-3           # 停机阈值：|Σd⁻| < TOL·Σ|y| 就停（<上位机软件> 里是写死的 0.001）
 
 # ------------------------------------------------------------ 多项式基线
 POLY_ORDER = 5                # 阶数太高会追着峰跑，把峰当基线扣掉
 POLY_NITER = 8                # 迭代次数（含 σ 剔除）
 POLY_SIGMA = 2.0
+
+# --------------------------------------------------------- Whittaker 平滑
+# 来源：<上位机软件> 的 Algorithm/deNoise/whittaker.py（wt_deNoise，默认 λ=10、d=2）。
+# 它是**全局惩罚最小二乘** min Σ(y-z)² + λ‖D_d z‖² —— 没有"窗口"这个概念，
+# 平滑强度全由 λ 决定。和 SG 的本质差别：SG 是局部卷积，窄峰会被卷积核定宽抹平；
+# Whittaker 是全局解，看起来"更讲道理"。
+#
+# ★ 但实测（2026-09-22，本机真实谱）它**救不了窄峰**，别指望：
+#   304 那条 FWHM≈2 像素的 652.38 nm 真谱线（同组 25/25 条都有，是真线）：
+#       SG 最小窗(5 点) → 峰高变化 +25.8%
+#       Whittaker λ=1   → +41.1%
+#       Whittaker λ=10  → +62.7%
+#   原因：要压住全谱噪声，λ 必须大到让**全局**曲率受限，而窄峰正是全谱曲率最大处，
+#   必然被优先削掉。所以窄峰问题不是"换个平滑器"能解的，见 tools/preprocess.py。
+WHITTAKER_LAMBDA = None       # None = 自动选 λ（按同一条"最高峰变化 ≤ 2%"判据扫候选）
+WHITTAKER_ORDER = 2
+WHITTAKER_LAMBDA_CANDIDATES = (1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0)
 
 # -------------------------------------------------------------------- 归一化
 # 用内标线归一化时，在目标波长 ±该窗口内找峰顶作为分母。

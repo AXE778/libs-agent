@@ -326,7 +326,8 @@ TOOLS: list[dict[str, Any]] = [
                 "要归一化就先问用户基准：max / area / line（line 必须同时给 norm_line_nm）。"
                 "\n\n★ 返回里出现 warnings、或 peak_change_pct 明显不为 0，**必须一并转述**，"
                 "不要只说「处理好了」。⚠ peak_change_pct：**正数=最高峰被压低、负数=被抬高，都算失真**，"
-                "优先直接念 peak_change_note。并把 output_path 给用户，后续分析用那个路径。"
+                "优先直接念 peak_change_note。峰有多宽要念返回里的 peak_fwhm_points / peak_fwhm_nm，"
+                "**不要自己估**（那是代码算好给你的，就是为了避免估错）。并把 output_path 给用户，后续分析用那个路径。"
             ),
             "parameters": {
                 "type": "object",
@@ -369,19 +370,26 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "baseline": {
                         "type": "string",
-                        "enum": ["none", "als", "poly"],
+                        "enum": ["none", "als", "airpls", "poly"],
                         "description": (
                             "基线校正方法。none=不校正（默认）；"
-                            "als=非对称最小二乘（推荐，能贴合缓慢起伏的背景）；"
+                            "als=非对称最小二乘（能贴合缓慢起伏的背景）；"
+                            "airpls=自适应迭代重加权（同一套算法族，对峰的抑制更狠、"
+                            "收敛更快；用户那套工业上位机的默认项就是它，要与现场结果对齐时用它）；"
                             "poly=多项式拟合（更简单，背景接近平缓曲线时够用）。"
+                            "★ 三者都是把「缓慢背景」扣掉；如果谱里没有明显抬高的背景，"
+                            "不要为了保险起见硬加基线校正 —— 扣多了会把弱峰一起削掉。"
                         ),
                     },
                     "smooth": {
                         "type": "string",
-                        "enum": ["none", "savgol", "moving"],
+                        "enum": ["none", "savgol", "moving", "whittaker"],
                         "description": (
-                            "平滑方法。savgol=Savitzky-Golay（默认，保峰形）；"
-                            "moving=滑动平均（更简单，但更容易削峰）；none=不平滑。"
+                            "平滑方法。savgol=Savitzky-Golay（默认，保峰形最好）；"
+                            "moving=滑动平均（更简单，但更容易削峰）；"
+                            "whittaker=全局惩罚最小二乘（没有窗口概念，强度由 λ 自动选；"
+                            "注意实测它在窄峰上比 savgol 更差，不要以为它更高级就用它）；"
+                            "none=不平滑。"
                         ),
                     },
                     "smooth_window_nm": {
@@ -630,6 +638,18 @@ def _t_generate_report(
     )
 
 
+def _fmt_smooth_scan(x: dict[str, Any]) -> str:
+    """把平滑候选扫描表的一行压成可读短串。
+
+    强度的量纲随方法变：savgol/moving 是「窗口 nm / 点数」，whittaker 是 λ。
+    """
+    if x.get("lambda") is not None:
+        label = "λ=%g" % x["lambda"]
+    else:
+        label = "%snm/%s点" % (x.get("window_nm"), x.get("window_points"))
+    return "%s:Δ%+.2f%%" % (label, x.get("peak_change_pct") or 0)
+
+
 def _slim_preprocess_report(res: dict[str, Any], max_outputs: int = 8) -> dict:
     """把预处理结果压成「模型够用、又不撑上下文」的样子。
 
@@ -660,19 +680,29 @@ def _slim_preprocess_report(res: dict[str, Any], max_outputs: int = 8) -> dict:
                     "n_points_negative": e.get("n_points_going_negative"),
                 })
             elif s.get("step") == "smooth":
+                # ★ 平滑强度的量纲随方法变（SG/滑动平均是窗口 nm 与点数；whittaker 是 λ），
+                #   所以不能写死字段名，按实际出现的那一个填 —— 否则 whittaker 会读出一堆 None。
                 item.update({
-                    "window_points": e.get("window_points"),
-                    "window_nm_effective": round(e.get("window_nm_effective") or 0, 3),
                     "chosen_by": e.get("chosen_by"),
                     "window_note": e.get("note"),
                     "peak_change_pct": e.get("peak_change_pct"),
                     "peak_change_note": e.get("peak_change_note"),
-                    "scan_nm_points_change": [
-                        "%snm/%s点:Δ%+.2f%%" % (x["window_nm"], x["window_points"],
-                                                x.get("peak_change_pct") or 0)
-                        for x in (e.get("window_scan") or [])
-                    ],
+                    "peak_fwhm_points": e.get("peak_fwhm_points"),
+                    "peak_fwhm_nm": e.get("peak_fwhm_nm"),
                 })
+                if e.get("skipped"):
+                    item["skipped"] = True
+                if e.get("lambda") is not None:
+                    item["lambda"] = e.get("lambda")
+                    item["order"] = e.get("order")
+                if e.get("window_points") is not None:
+                    item["window_points"] = e.get("window_points")
+                    if e.get("window_nm_effective") is not None:
+                        item["window_nm_effective"] = round(e["window_nm_effective"], 3)
+                if e.get("window_scan"):
+                    item["scan_strength_change"] = [
+                        _fmt_smooth_scan(x) for x in e["window_scan"]
+                    ]
             elif s.get("step") == "normalize":
                 item.update({"based_on": e.get("based_on"),
                              "divisor": e.get("divisor")})

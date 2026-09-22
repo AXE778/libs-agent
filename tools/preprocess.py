@@ -31,6 +31,18 @@ intensity_units="relative" 和一条警告，下游报告要照着这个措辞�
 理由写在 config/preprocess.py 的模块注释里（简单说：平滑要求等间隔网格所以插值必须第一；
 先平滑再去基线会把峰压矮；归一化的分母必须基于成品而不是半成品）。
 
+============================== 可用的算法 ==============================
+  基线  ：none / als（Eilers 非对称最小二乘）/ poly（迭代多项式 + σ 剔除）/
+          airpls（自适应迭代重加权，移植自 <上位机软件> 那套工业上位机 ↔ Zhang 2010）
+  平滑  ：none / savgol（Savitzky-Golay）/ moving（滑动平均）/
+          whittaker（Eilers 惩罚最小二乘，同样移植自 <上位机软件>）
+  归一化：none / max / area / line
+
+★ 几种基线其实共用同一个核（_whittaker_solve，解 (W+λDᵀD)z = W y），
+  唯一的差别是权重 w 怎么给：ALS 给固定两档 p / 1-p，airPLS 给逐轮指数权重，
+  多项式版换成带 σ 剔除的迭代拟合。别被几个名字唬住。
+★ 来源对照、以及「为什么不照抄 <上位机软件> 的执行顺序」，写在 config/preprocess.py 里。
+
 ============================ 绝 不 外 推 ============================
 两组数据波长上限不同（954 nm vs 812 nm）。对齐到统一轴时，
 超出一条谱自身覆盖范围的格点**一个都不生成**（既不用 NaN 填，也不重复端点值）。
@@ -83,19 +95,26 @@ class PreprocessPlan:
     grid_range: tuple[float, float] | None = None   # 只在 common 且想手动指定时用
 
     # --- 基线 ---
-    baseline: str = "none"                # none | als | poly
+    baseline: str = "none"                # none | als | airpls | poly
     als_lambda: float = P.ALS_LAMBDA
     als_p: float = P.ALS_P
     als_niter: int = P.ALS_NITER
+    als_order: int = P.ALS_ORDER          # 差分阶数 d（<上位机软件> 的 als(data, lam, d, …) 也公开它）
+    airpls_lambda: float = P.AIRPLS_LAMBDA
+    airpls_order: int = P.AIRPLS_ORDER
+    airpls_niter: int = P.AIRPLS_NITER
+    airpls_tol: float = P.AIRPLS_TOL
     poly_order: int = P.POLY_ORDER
     poly_niter: int = P.POLY_NITER
     poly_sigma: float = P.POLY_SIGMA
 
     # --- 平滑 ---
     # 默认就给 savgol：它是本流水线里唯一"无害"的一步（不改变语义、只压噪声）。
-    smooth: str = "savgol"                # none | savgol | moving
-    smooth_window_nm: float | None = None # 不给就用 config 里的 0.80 nm
+    smooth: str = "savgol"                # none | savgol | moving | whittaker
+    smooth_window_nm: float | None = None # 不给（None）= **自动选强度**，见 _choose_smoother()
     smooth_polyorder: int = P.SMOOTH_POLYORDER
+    whittaker_lambda: float | None = None # 只在 smooth="whittaker" 时用；None（默认）= 自动选 λ
+    whittaker_order: int = P.WHITTAKER_ORDER   # Whittaker 惩罚的差分阶数 d
 
     # --- 归一化 ---
     normalize: str = "none"               # none | max | area | line
@@ -135,6 +154,21 @@ class PreprocessPlan:
                     f"（再小就等于没平滑），收到 {self.smooth_window_nm}")
         if int(self.smooth_polyorder) < 1:
             raise PreprocessError("smooth_polyorder 至少要 1")
+
+        # 三个"差分阶数"共用一条约束（1 阶=斜率，2 阶=曲率，再高基线会软到跟着背景跑）
+        for _name, _val in (("als_order", self.als_order),
+                            ("airpls_order", self.airpls_order),
+                            ("whittaker_order", self.whittaker_order)):
+            if not (1 <= int(_val) <= 4):
+                raise PreprocessError(
+                    f"{_name} 要在 1~4 之间（惩罚几阶差分），收到 {_val}")
+        if self.whittaker_lambda is not None and float(self.whittaker_lambda) <= 0:
+            raise PreprocessError(
+                f"whittaker_lambda 必须大于 0（它是平滑强度），收到 {self.whittaker_lambda}")
+        if int(self.airpls_niter) < 1:
+            raise PreprocessError("airpls_niter 至少要 1")
+        if float(self.airpls_tol) <= 0:
+            raise PreprocessError("airpls_tol 必须大于 0")
 
         if self.normalize == "line":
             if self.norm_line_nm is None:
@@ -184,11 +218,21 @@ class PreprocessPlan:
         if self.baseline == "none":
             bits.append("基线：不校正")
         elif self.baseline == "als":
-            bits.append(f"基线：ALS（λ={self.als_lambda:g}, p={self.als_p:g}）")
+            bits.append(f"基线：ALS（λ={self.als_lambda:g}, p={self.als_p:g}, "
+                        f"{self.als_order} 阶差分）")
+        elif self.baseline == "airpls":
+            bits.append(f"基线：airPLS（λ={self.airpls_lambda:g}, "
+                        f"{self.airpls_order} 阶差分）")
         else:
             bits.append(f"基线：{self.poly_order} 阶多项式")
         if self.smooth == "none":
             bits.append("平滑：不平滑")
+        elif self.smooth == "whittaker":
+            if self.whittaker_lambda:
+                bits.append(f"平滑：Whittaker（λ={self.whittaker_lambda:g}）")
+            else:
+                bits.append("平滑：Whittaker（λ 自动，最高峰变化上限 "
+                            f"±{P.SMOOTH_MAX_PEAK_CHANGE_PCT:g}%）")
         elif self.smooth_window_nm:
             bits.append(f"平滑：{self.smooth}（窗口指定 {self.smooth_window_nm:g} nm）")
         else:
@@ -339,34 +383,139 @@ def _uniform_axis(wl: np.ndarray, step_nm: float,
 
 
 # ---------------------------------------------------------------------------
-# 基线：ALS（Eilers & Boelens 非对称最小二乘）
+# 基线的共同内核：Whittaker 惩罚最小二乘
 # ---------------------------------------------------------------------------
-def _als_baseline(y: np.ndarray, lam: float, p: float, niter: int) -> np.ndarray:
-    """非对称最小二乘基线。
+def _diff_matrix(n: int, order: int):
+    """d 阶差分矩阵 D（形状 (n-d) × n），稀疏。
 
-    思路：既想贴合数据，又想让基线尽量平滑（惩罚二阶差分），
-    同时用一个非对称权重 w —— 明显高于当前基线的点（那就是峰）权重压到 p（很小），
-    于是拟合线会从峰的下方"穿过去"，把峰留出来。
+    构造方式与 <上位机软件> 的 __WhittakerSmooth / __speyediff 一致：
+    从稀疏单位阵出发，反复做 D = D[1:] - D[:-1]。
+
+    ★ 为什么不用 np.diff(np.eye(n), d)：
+      <上位机软件> 的 als.py 就是那么写的，但 np.eye(7745) 是 7745² 个 float64
+      ≈ 480 MB —— 单次调用就吃掉半个 G。稀疏逐次差分得到的矩阵完全一样，
+      内存却是 O(n·d)。
+    """
+    from scipy import sparse
+
+    n = int(n)
+    order = int(order)
+    if order <= 0 or n <= order:
+        return None
+    D = sparse.eye(n, format="csc")
+    for _ in range(order):
+        D = D[1:] - D[:-1]
+    return D
+
+
+def _whittaker_solve(w: np.ndarray, y: np.ndarray, lam: float, order: int) -> np.ndarray:
+    """解 (W + λ·DᵀD) z = W y —— ALS / airPLS / Whittaker 平滑共用的一个内核。
+
+    三个方法只差在 w 怎么给：
+      · ALS / airPLS：w 是「峰 / 非峰」的权重，于是解偏向从峰的下方穿过；
+      · Whittaker 平滑：w 全 1，于是就是一个纯平滑器。
     """
     from scipy import sparse
     from scipy.sparse.linalg import spsolve
 
+    y = np.asarray(y, dtype=float)
     n = int(y.size)
-    if n < 4:
-        return y.astype(float, copy=True)
+    D = _diff_matrix(n, order)
+    if D is None:
+        return y.copy()
+    w = np.asarray(w, dtype=float)
+    W = sparse.diags(w, 0, shape=(n, n), format="csc")
+    A = (W + float(lam) * (D.T @ D)).tocsc()
+    return np.asarray(spsolve(A, w * y))
 
-    # 二阶差分矩阵 D（(n-2) × n），D.T @ D 就是曲率惩罚
-    D = sparse.diags([1.0, -2.0, 1.0], [0, 1, 2], shape=(n - 2, n), format="csc")
-    curvature = lam * (D.T @ D)
 
-    w = np.ones(n)
-    z = y.astype(float, copy=True)
+# ---------------------------------------------------------------------------
+# 基线 1：ALS（Eilers & Boelens 非对称最小二乘）
+# ---------------------------------------------------------------------------
+def _als_baseline(y: np.ndarray, lam: float, p: float, niter: int,
+                  order: int = P.ALS_ORDER) -> np.ndarray:
+    """非对称最小二乘基线。
+
+    思路：既想贴合数据，又想让基线尽量平滑（惩罚 d 阶差分），
+    同时用一个非对称权重 w —— 明显高于当前基线的点（那就是峰）权重压到 p（很小），
+    于是拟合线会从峰的下方「穿过去」，把峰留出来。
+
+    d（差分阶数）从 <上位机软件> 的 als(data, lam, d, p, niter) 对齐过来：
+    d=1 惩罚斜率、d=2 惩罚曲率（默认）。阶数越高基线越"软"、越容易跟着缓变背景起伏。
+    """
+    y = np.asarray(y, dtype=float)
+    if y.size < 4:
+        return y.copy()
+
+    w = np.ones(int(y.size))
+    z = y.copy()
     for _ in range(max(1, int(niter))):
-        W = sparse.diags(w, 0, shape=(n, n), format="csc")
-        z = spsolve((W + curvature).tocsc(), w * y)
-        # 高于基线的点（峰）权重降到 p，低于的留 1-p —— 这就是"非对称"
+        z = _whittaker_solve(w, y, lam, order)
+        # 高于基线的点（峰）权重降到 p，低于的留 1-p —— 这就是「非对称」
         w = np.where(y > z, p, 1.0 - p)
     return z
+
+
+# ---------------------------------------------------------------------------
+# 基线 2：airPLS（自适应迭代重加权，移植自 <上位机软件> ↔ Zhang et al. 2010）
+# ---------------------------------------------------------------------------
+def _airpls_baseline(y: np.ndarray, lam: float, order: int, niter: int,
+                     tol: float) -> np.ndarray:
+    """airPLS 基线（返回**基线本身**，不是扣完的谱）。
+
+    与 ALS 用同一个惩罚最小二乘内核，差别只在**权重更新规则**：
+      · 高于基线的点（峰）权重直接置 0 —— 比 ALS 的 p=0.01 更彻底地「看不见」峰；
+      · 低于基线的点权重按 exp(i·|d⁻| / Σ|d⁻|) 逐轮**指数**加重（i 是轮次）；
+      · 两端点单独钉住（见下）。
+    停机判据：负残差总量已经很小（|Σd⁻| < tol·Σ|y|），也就是基线贴着数据下沿了。
+    收敛比 ALS 快：本机真实谱实测 4~5 轮就触发停机。
+
+    ★ 端点那一行是本算法最容易抄错的地方。
+      <上位机软件> 写的是 w[0] = exp(i · d⁻.max() / Σ|d⁻|)，其中 d⁻ 是**带符号的**负残差，
+      所以 d⁻.max() 取的是「最接近 0 的那个负值」（仍是负数）→ 指数为负 → 权重 < 1
+      → 两端被拉向基线。
+      若写成 np.abs(d⁻).max()（幅值最大的那个负残差），指数会翻成正的、权重 > 1，
+      端点反而被允许往上抬。实测两种写法最终权重差 0.062、整条基线差 ~1e-5 相对量 ——
+      画图看不出来，但那是抄错，不是等价变形。改回带符号写法之后，
+      本实现与 <上位机软件> 原版**逐位一致**（复现脚本：scripts/verify_baseline_port.py）。
+    """
+    y = np.asarray(y, dtype=float)
+    n = int(y.size)
+    if n < 4:
+        return y.copy()
+
+    w = np.ones(n)
+    z = y.copy()
+    total = float(np.abs(y).sum())
+    for i in range(1, int(niter) + 1):
+        z = _whittaker_solve(w, y, lam, order)
+        d = y - z
+        neg = d < 0
+        dssn = float(np.abs(d[neg]).sum())
+        # dssn == 0：没有任何点低于基线，权重失去依据；再往下就是除零。
+        # （<上位机软件> 只判 dssn < tol·total，而 0 < 0 为假 → 极端输入下会除零。
+        #   这里补上 dssn <= 0 这一条，其余判据与它逐条一致。）
+        if dssn <= 0.0 or dssn < float(tol) * total or i == int(niter):
+            break
+        w = np.zeros(n)
+        w[neg] = np.exp(i * np.abs(d[neg]) / dssn)
+        w[0] = w[-1] = float(np.exp(i * float(d[neg].max()) / dssn))
+    return z
+
+
+# ---------------------------------------------------------------------------
+# 平滑 0：Whittaker 平滑（移植自 <上位机软件> ↔ Eilers 2003 "A perfect smoother"）
+# ---------------------------------------------------------------------------
+def _whittaker_smooth(y: np.ndarray, lam: float, order: int) -> np.ndarray:
+    """Whittaker 平滑：w 全 1 的惩罚最小二乘解，即 min Σ(y-z)² + λ‖D_d z‖²。
+
+    没有「窗口」概念，λ 是唯一的强度旋钮。与 SG 的差别、以及
+    「它同样救不了窄峰」的实测数据，见 config/preprocess.py 里 WHITTAKER_LAMBDA 那段。
+    """
+    y = np.asarray(y, dtype=float)
+    if y.size < 4:
+        return y.copy()
+    return _whittaker_solve(np.ones(int(y.size)), y, lam, order)
 
 
 def _poly_baseline(y: np.ndarray, order: int, niter: int, sigma: float) -> np.ndarray:
@@ -470,95 +619,168 @@ def _peak_change_note(change_pct: float) -> str:
     return f"最高峰被抬高 {abs(change_pct):.2f}%"
 
 
-def _choose_window(y: np.ndarray, method: str, window_nm: float | None,
-                   polyorder: int, step_nm: float
-                   ) -> tuple[int, dict | None, list[dict]]:
-    """决定平滑窗口（换算成点数）。
+def _peak_fwhm(y: np.ndarray, step_nm: float) -> tuple[int, float]:
+    """全局最高峰的半高全宽，用「半高以上的连续点数」度量（返回 (点数, nm)）。
 
-    调用方给了具体 nm  → 就用它。
-    window_nm 是 None（默认）→ **自动选**：候选窗口从小到大挨个试，
-      取「全局最高峰变化量 |Δ| ≤ SMOOTH_MAX_PEAK_CHANGE_PCT」的那个**最大**窗口。
+    ★ 为什么值得专门算出来返回：
+      实测（2026-09-22）模型在被问「峰有没有被改」时，会**自己编一个峰宽** ——
+      一次回答说「这条谱的峰非常窄（约 1.3 个像素宽）」，而真实值是 2 个点。
+      与其让它猜，不如算给它。这正是本项目「绝不让模型做算术」那条纪律的延伸。
 
-    ★ 为什么必须自动，不能给一个固定值：
-      本机三条真实谱实测（2026-09-21）—— 同样是 0.8 nm 窗口：
-        316 谱（峰 FWHM 5.5~18.5 像素）：峰高损失 −3.3%（几乎无损，好事）
-        304 谱（主峰 FWHM 只有 1.6 像素）：峰高损失 −55%（灾难，峰被磨平了）
-      峰宽差了 10 倍，固定窗口注定要坑掉其中一边。
+    用点数而不是去拟合一个 FWHM：本机像素步长 0.1 nm 量级，而我们要区分的峰宽
+    只差个位数像素，拟合出来的小数位是假精度。
+    """
+    y = np.asarray(y, dtype=float)
+    if y.size == 0:
+        return 0, 0.0
+    k = int(np.argmax(y))
+    half = float(y[k]) / 2.0
+    if half <= 0:
+        return 0, 0.0
+    lo = k
+    while lo - 1 >= 0 and y[lo - 1] >= half:
+        lo -= 1
+    hi = k
+    while hi + 1 < y.size and y[hi + 1] >= half:
+        hi += 1
+    n = int(hi - lo + 1)
+    return n, float(n * step_nm)
 
-    ★ 反直觉但实测成立：**平滑并不总是降低峰值**。316 谱平滑后最高峰反而略升
+
+def _smooth_candidate(y: np.ndarray, method: str, cand: float,
+                      polyorder: int, step_nm: float
+                      ) -> tuple[np.ndarray | None, dict | None]:
+    """按一个候选强度做一次平滑。
+
+    cand 的含义随方法而变：
+      savgol / moving → 窗口宽度（nm）
+      whittaker       → λ
+    候选不合法（窗口放不下 / λ 非正）时返回 (None, None)。
+    """
+    if method == "whittaker":
+        lam = float(cand)
+        if lam <= 0:
+            return None, None
+        return _whittaker_smooth(y, lam, polyorder), {
+            "lambda": lam, "order": int(polyorder)}
+
+    w = _window_points(float(cand), step_nm, polyorder, int(y.size))
+    floor_points = max(P.SMOOTH_MIN_WINDOW_POINTS, int(polyorder) + 2)
+    if w < floor_points:
+        return None, None
+    return _smooth_once(y, method, w, polyorder), {
+        "window_nm": float(cand), "window_points": int(w)}
+
+
+def _choose_smoother(y: np.ndarray, method: str, window_nm: float | None,
+                     wt_lambda: float | None, polyorder: int, step_nm: float
+                     ) -> tuple[np.ndarray | None, dict | None, list[dict]]:
+    """挑平滑强度，顺便把平滑做掉。返回 (平滑后的谱, 选择说明, 候选扫描表)。
+
+    两种方法族的「强度」量纲不同（SG 是窗口 nm，Whittaker 是 λ），
+    但**选择判据是同一条**：候选强度从小到大挨个试，取
+      「全局最高峰变化量 |Δ| ≤ SMOOTH_MAX_PEAK_CHANGE_PCT」的那个**最大**强度。
+
+    ★ 为什么必须自动选，不能写死一个强度：
+      本机真实谱实测（2026-09-22）—— 同样是 SG 最小窗（5 点）：
+        316 谱（主峰半高以上 9 个点）：峰高变化 −1.0%（几乎无损，好事）
+        700V 谱（半高以上 8 个点）：   −1.9%（可接受）
+        304 谱（652.38 nm 主峰半高以上只有 1 个点）：+28.0%（灾难，峰被抹平）
+      峰宽差了近一个数量级，写死强度注定要坑掉其中一边。
+
+      ⚠ 2026-09-22 更正两处早年记错的数：
+      （a）之前把 304 那个峰记成「FWHM≈1.6 像素的窄峰」，还怀疑过它可能是宇宙射线
+          （单像素尖刺形状和窄谱线一模一样，单条谱分不开）。这次拿 data-304-1
+          整组 25 条谱查了重复性 —— 25/25 条在该波长都有峰、峰顶波长标准差仅 0.030 nm、
+          峰/肩比值中位 4.13（且多数已打饱和）→ **它是一条真实的、正好卡在仪器
+          分辨率极限上的分析线**，不是坏点。也就是说这个谱的平滑损失是真损失，
+          不能用「那是假峰」把它打发掉。
+      （b）峰宽**随网格而变**：同一条线在原始网格上半高以上是 2 个点，
+          插值到 0.102 nm 均匀网格后只剩 1 个点 —— 重采样本身就把峰顶削平了一点。
+          而最小 SG 窗是 5 个点，所以这个损失在流水线里是躲不掉的。
+          下面报的 peak_fwhm_* 量的都是「平滑前的那一刻、即插值后的网格」，口径统一。
+
+    ★ 反直觉但实测成立：**平滑并不总是降低峰值**。304 谱平滑后最高峰反而明显抬高
       （峰顶原本的小凹口被填平）。所以判据是「变化的**绝对值** ≤ 2%」，
       而不是「只许下降」—— 抬高同样是失真，若只卡单边，会出现
-      「窗口越大越容易通过」的漏洞，自动选窗就退化成永远返回最大窗口。
-
-    返回 (窗口点数, 选择说明, 候选扫描表)。
+      「强度越大越容易通过」的漏洞，自动选强就退化成永远返回最大强度。
     """
     n = int(y.size)
     if n < 5 or step_nm <= 0:
-        return 0, None, []
+        return None, None, []
 
-    if window_nm is not None:
-        w = _window_points(float(window_nm), step_nm, polyorder, n)
-        return (w, {"chosen_by": "调用方指定"}, []) if w > 0 else (0, None, [])
+    explicit = wt_lambda if method == "whittaker" else window_nm
+    if explicit is not None:
+        out, info = _smooth_candidate(y, method, explicit, polyorder, step_nm)
+        if out is None:
+            return None, None, []
+        return out, {"chosen_by": "调用方指定", **info}, []
 
-    floor_points = max(P.SMOOTH_MIN_WINDOW_POINTS, int(polyorder) + 2)
+    cands = (P.WHITTAKER_LAMBDA_CANDIDATES if method == "whittaker"
+             else P.SMOOTH_WINDOW_CANDIDATES_NM)
+
     scan: list[dict] = []
-    chosen: tuple[int, float, float] | None = None
-
-    for cand in P.SMOOTH_WINDOW_CANDIDATES_NM:
-        w = _window_points(float(cand), step_nm, polyorder, n)
-        if w < floor_points:
+    valid: list[tuple[float, np.ndarray, dict, float]] = []
+    for cand in cands:
+        out, info = _smooth_candidate(y, method, cand, polyorder, step_nm)
+        if out is None:
             continue
-        change = _peak_change_pct(y, _smooth_once(y, method, w, polyorder))
+        change = _peak_change_pct(y, out)
         ok = bool(abs(change) <= P.SMOOTH_MAX_PEAK_CHANGE_PCT)
-        scan.append({"window_nm": float(cand), "window_points": int(w),
-                     "peak_change_pct": round(change, 3),
+        scan.append({**info, "peak_change_pct": round(change, 3),
                      "peak_change_note": _peak_change_note(change),
                      "acceptable": ok})
-        if ok:
-            chosen = (w, float(cand), change)
-        # 故意不 break：峰宽差异大时「窗口越大变化越大」并不严格单调，
-        # 扫完整张表才能挑到真正最大的那个可行窗口。
+        valid.append((float(cand), out, info, change))
+        # 故意不 break：峰宽差异大时「强度越大变化越大」并不严格单调，
+        # 扫完整张表才能挑到真正最大的那个可行强度。
 
-    if chosen is None:
-        if not scan:                      # 数据太短，连最小窗口都放不下
-            return 0, None, scan
-        s = scan[0]
-        return int(s["window_points"]), {
+    if not valid:                      # 数据太短，连最小强度都放不下
+        return None, None, scan
+
+    passed = [v for v in valid if abs(v[3]) <= P.SMOOTH_MAX_PEAK_CHANGE_PCT]
+    if not passed:
+        # 这条谱的峰太窄：连最小强度都会明显改峰。
+        # 现在仍按最小强度平滑，但把代价**如实写进返回**（不静默、不假装无损）。
+        # 「要不要干脆跳过平滑」是一条策略选择，见 config/preprocess.py 的说明。
+        cand, out, info, change = valid[0]
+        return out, {
             "chosen_by": "auto",
-            "note": "这条谱的峰太窄，连最小窗口都会明显改峰，已取最小窗口并如实报告代价",
-            "peak_change_pct": s["peak_change_pct"],
-            "peak_change_note": s["peak_change_note"],
+            "note": "这条谱的峰太窄，连最小强度都会明显改峰，已取最小强度并如实报告代价",
+            **info,
+            "peak_change_pct": round(change, 3),
+            "peak_change_note": _peak_change_note(change),
         }, scan
 
-    w, cand, change = chosen
-    return int(w), {"chosen_by": "auto", "window_nm": cand,
-                    "peak_change_pct": round(change, 3),
-                    "peak_change_note": _peak_change_note(change)}, scan
+    cand, out, info, change = passed[-1]
+    return out, {"chosen_by": "auto", **info,
+                 "peak_change_pct": round(change, 3),
+                 "peak_change_note": _peak_change_note(change)}, scan
 
 
 def _smooth(y: np.ndarray, method: str, window_nm: float | None,
-            polyorder: int, step_nm: float) -> tuple[np.ndarray, dict]:
-    n = int(y.size)
-    w, how, scan = _choose_window(y, method, window_nm, polyorder, step_nm)
-    if w <= 0:
+            wt_lambda: float | None, polyorder: int, step_nm: float
+            ) -> tuple[np.ndarray, dict]:
+    smoothed, how, scan = _choose_smoother(y, method, window_nm, wt_lambda,
+                                           polyorder, step_nm)
+    if smoothed is None:
         return y.astype(float, copy=True), {
             "skipped": True,
-            "reason": "数据太短或步长无效，跳过平滑",
+            "reason": "数据太短、步长无效，或该方法的候选强度全都放不下，跳过平滑",
         }
 
-    out = _smooth_once(y, method, w, polyorder)
-    info = {
-        "window_points": int(w),
-        "window_nm_requested": (float(window_nm) if window_nm is not None else None),
-        "window_nm_effective": float(w * step_nm),
-        "polyorder": int(polyorder),
-    }
-    if how:
-        info.update(how)
+    info: dict = {**how}
+    if method != "whittaker":
+        # Whittaker 没有窗口概念，这两个字段对它无意义，不写（避免下游读到一个假的 0 nm）
+        info["window_nm_requested"] = (float(window_nm) if window_nm is not None else None)
+        w = info.get("window_points")
+        info["window_nm_effective"] = float(w * step_nm) if w else 0.0
+        # 注意：对 savgol/moving，polyorder 是 SG 的多项式阶数；
+        #       对 whittaker，同一个入参是惩罚差分的阶数，见 _smooth_candidate 里的 order 字段。
+        info["polyorder"] = int(polyorder)
     if scan:
-        # 把候选扫描表一起返回：选了哪个窗口、为什么，是可以被复核的，不是黑箱
+        # 把候选扫描表一起返回：选了哪个强度、为什么，是可以被复核的，不是黑箱
         info["window_scan"] = scan
-    return out, info
+    return smoothed, info
 
 
 # ---------------------------------------------------------------------------
@@ -702,9 +924,18 @@ def apply_plan(spec: Spectrum, plan: PreprocessPlan,
     # ---------- 2) 基线校正 ----------
     if plan.baseline != "none":
         if plan.baseline == "als":
-            base = _als_baseline(cur.intensity, plan.als_lambda, plan.als_p, plan.als_niter)
+            base = _als_baseline(cur.intensity, plan.als_lambda, plan.als_p,
+                                 plan.als_niter, plan.als_order)
             params = {"lambda": float(plan.als_lambda), "p": float(plan.als_p),
-                      "niter": int(plan.als_niter)}
+                      "niter": int(plan.als_niter), "order": int(plan.als_order)}
+        elif plan.baseline == "airpls":
+            base = _airpls_baseline(cur.intensity, plan.airpls_lambda,
+                                    plan.airpls_order, plan.airpls_niter,
+                                    plan.airpls_tol)
+            params = {"lambda": float(plan.airpls_lambda),
+                      "order": int(plan.airpls_order),
+                      "niter": int(plan.airpls_niter),
+                      "tol": float(plan.airpls_tol)}
         else:
             base = _poly_baseline(cur.intensity, plan.poly_order,
                                   plan.poly_niter, plan.poly_sigma)
@@ -735,30 +966,45 @@ def apply_plan(spec: Spectrum, plan: PreprocessPlan,
 
     # ---------- 3) 平滑 ----------
     if plan.smooth != "none":
-        win = plan.smooth_window_nm      # None = 自动选窗（见 _choose_window）
+        win = plan.smooth_window_nm      # None = 自动选强度（见 _choose_smoother）
+        # SG 的「多项式阶数」与 Whittaker 的「惩罚差分阶数」是两个概念、各有默认值，
+        # 在这里解析成最终要传下去的那一个。
+        eff_order = (plan.whittaker_order if plan.smooth == "whittaker"
+                     else plan.smooth_polyorder)
         step_eff = _median_step(cur.wavelength)
         smoothed, info = _smooth(cur.intensity, plan.smooth, win,
-                                 plan.smooth_polyorder, step_eff)
+                                 plan.whittaker_lambda, eff_order, step_eff)
         peak_before = float(cur.intensity.max())
         peak_after = float(smoothed.max())
         change_pct = _peak_change_pct(cur.intensity, smoothed)
+        fwhm_pts, fwhm_nm = _peak_fwhm(cur.intensity, step_eff)
         info.update({
             "peak_before": peak_before,
             "peak_after": peak_after,
             "peak_change_pct": round(float(change_pct), 3),
             "peak_change_note": _peak_change_note(change_pct),
+            # 峰宽一起给出来：它是「为什么这个窗口会把峰削掉」的直接依据，
+            # 也堵住模型自己编一个峰宽的漏洞（见 _peak_fwhm 的注释）。
+            "peak_fwhm_points": fwhm_pts,
+            "peak_fwhm_nm": round(fwhm_nm, 4),
         })
         steps.append({
             "step": "smooth",
             "method": plan.smooth,
-            "params": {"window_nm": win, "polyorder": int(plan.smooth_polyorder)},
+            "params": ({"lambda": plan.whittaker_lambda, "order": int(eff_order)}
+                       if plan.smooth == "whittaker"
+                       else {"window_nm": win, "polyorder": int(eff_order)}),
             "effect": info,
         })
         if abs(change_pct) > 5.0:
+            knob = ("whittaker_lambda" if plan.smooth == "whittaker"
+                    else "smooth_window_nm")
+            scale = (f"λ={info['lambda']:g}" if plan.smooth == "whittaker"
+                     else f"窗口约 {info.get('window_nm_effective', 0):.2f} nm")
             warns.append(
                 f"平滑后最高峰变化较大：{_peak_change_note(change_pct)}"
-                f"（窗口约 {info.get('window_nm_effective', 0):.2f} nm，相对峰宽偏大）。"
-                "要拿峰高做比较时请把 smooth_window_nm 调小。"
+                f"（{scale}，相对峰宽偏大）。"
+                f"要拿峰高做比较时请把 {knob} 调小。"
             )
         cur = Spectrum(cur.wavelength, smoothed, dict(cur.meta))
 
