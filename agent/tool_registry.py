@@ -58,9 +58,11 @@ TOOLS: list[dict[str, Any]] = [
             "name": "list_available_spectra",
             "description": (
                 "查看光谱数据有哪些。只读文件名和目录，不读光谱内容，很快。"
-                "两种用法：① 不传 query → 返回数据总览（有几组数据、每组网格多大）；"
-                "② 传 query → 返回匹配的具体文件路径，供 load_spectrum_summary / plot_spectra 使用。"
-                "当用户问「有哪些数据 / 304 测了哪些点」时用它。"
+                "两种用法：① 不传 query → 返回数据总览（有几组数据、每组多大、每组是什么网格、多少测点）；"
+                "② 传 query → 返回匹配的文件路径，**并附上命中组摘要 matched_groups**，"
+                "供 load_spectrum_summary / plot_spectra 使用。"
+                "★ 问「有哪些数据 / 测了哪些点 / 有哪些材料」时**不要传 query**，"
+                "取一次总览就够（总览里已经有网格与测点数），别先筛一遍再回头补总览。"
                 f"数据根目录固定在 {DATA_ROOT}。"
             ),
             "parameters": {
@@ -308,34 +310,23 @@ TOOLS: list[dict[str, Any]] = [
                 "把处理后的谱写成一类新文件（outputs/preprocessed/），返回新文件路径，"
                 "供后续工具（analyze_element_lines / plot_spectra 等）继续使用。"
                 "当用户说「先平滑一下 / 降噪 / 做个基线校正 / 归一化 / 把几条谱对到同一个波长轴上」时用它。"
-                "\n\n★ 执行顺序是**固定**的：插值 → 基线校正 → 平滑 → 归一化。"
-                "你只能选方法和参数，不能改顺序（顺序写死是为了结果可复现、可解释）。"
-                "\n\n★★ 三条必须守住、并且必须转述给用户的边界 ★★"
-                "\n① **归一化会改变「强度」的含义**。归一化之后 intensity 不再是原始计数，"
-                "只能说「相对强度 / 峰高之比」，**不能再说某点的绝对强度是多少**，"
-                "跨测点比也不再反映信号绝对强弱。所以**除非用户明确要求，normalize 一律保持 none**。"
-                "\n② **预处理后的谱不要再拿去做质量检查**（check_spectrum_quality / check_group_quality）。"
-                "平滑会把疑似尖峰磨平、把饱和的平顶拉圆、把信噪比抬高 —— 在预处理过的谱上做质量检查"
-                "会得出**假的合格结论**。质量检查一律用原始谱。"
-                "\n③ **绝不外推**。两组数据波长上限不同（不锈钢那套到 953.97 nm，快速采集那套只到 812.20 nm），"
-                "统一波长轴时超出某条谱覆盖范围的波段**一个点都不会生成**，因此统一轴模式下各条谱长度"
-                "才可能一致（取交集）。如果用户想让 812 nm 的谱「也有一条到 954 nm 的曲线」，"
-                "要明确告诉他：那部分数据不存在，系统不会编。"
-                "\n\n★ 参数怎么选："
-                "\n  · **不传任何参数 = 最保守的默认链**（插值成均匀网格 + 自适应平滑，不基线、不归一化），"
-                "适合大多数「帮我处理一下这条谱」的请求。"
-                "\n  · 想让**多条谱能逐点比较**（例如叠成矩阵做二维强度图）：interpolate=\"common\"。"
-                "\n  · 背景明显偏高（质量检查报 baseline 偏高）时再上 baseline=\"als\"。"
-                "\n  · **平滑窗口默认自动**（自动挑「最高峰变化 |Δ| 不超过 2%」的最大窗口），"
-                "因为这个值必须跟着谱线宽度走 —— 本机实测同一台仪器上峰宽相差 10 倍，"
-                "固定窗口对某条谱几乎无损、对另一条能把峰削掉一半。**不要随便指定 smooth_window_nm**。"
-                "\n  · 要归一化就先问用户用哪种基准：max（按自身最强峰）/ area（按全谱面积）/ "
-                "line（按某条内标线，必须同时给 norm_line_nm）。"
-                "\n\n★ 返回里如果出现 warnings、或平滑信息里 peak_change_pct 明显不为 0，"
-                "**必须把这些边界一起转述给用户**，不要只说一句「处理好了」。"
-                "⚠ peak_change_pct 的符号：**正数=最高峰被压低，负数=被抬高，都算失真**，"
-                "优先直接念 peak_change_note。"
-                "同时把 output_path 给用户，后续分析就用那个路径。"
+                "\n\n执行顺序**固定**：插值 → 基线校正 → 平滑 → 归一化。你只选方法和参数，不能改顺序"
+                "（顺序写死是为了结果可复现、可解释）。"
+                "\n\n★★ 三条边界见系统提示「第六纪律」，必须执行、也必须转述给用户 ★★"
+                "\n① **归一化改变强度含义** —— 除非用户明确要求，normalize 一律保持 none；"
+                "\n② **预处理后的谱不得再送去质量检查**（check_spectrum_quality / check_group_quality）"
+                "—— 会得出假的合格结论，质检一律用原始谱；"
+                "\n③ **绝不外推** —— 统一波长轴时自动取交集，超出覆盖范围的波段一个点都不生成"
+                "（不锈钢那套到 953.97 nm、快速采集那套只到 812.20 nm），用户要更长就得明说数据不存在。"
+                "\n\n★ 参数：**不传任何参数 = 最保守的默认链**（插值成均匀网格 + 自适应平滑，不基线、不归一化），"
+                "适合大多数「帮我处理一下这条谱」。要让多条谱**能逐点比较**（如叠成矩阵做二维强度图）"
+                "才用 interpolate=\"common\"；背景明显偏高（质检报 baseline 偏高）再上 baseline=\"als\"。"
+                "**别手填 smooth_window_nm / grid_step_nm / grid_range** —— 平滑窗口默认自动挑"
+                "（跟随谱线宽度，本机实测同一仪器上峰宽相差 10 倍），手填容易把峰削掉或把点数抬爆。"
+                "要归一化就先问用户基准：max / area / line（line 必须同时给 norm_line_nm）。"
+                "\n\n★ 返回里出现 warnings、或 peak_change_pct 明显不为 0，**必须一并转述**，"
+                "不要只说「处理好了」。⚠ peak_change_pct：**正数=最高峰被压低、负数=被抬高，都算失真**，"
+                "优先直接念 peak_change_note。并把 output_path 给用户，后续分析用那个路径。"
             ),
             "parameters": {
                 "type": "object",
@@ -450,11 +441,27 @@ def _t_list_available_spectra(query: str | None = None, limit: int = 25) -> dict
 
     limit = max(1, min(int(limit or 25), 200))
     res = spectrum_catalog.find_spectra(DATA_ROOT, str(query), limit=limit)
+
+    # ★ 传了 query 时，顺带附一份「命中组摘要」。
+    #   为什么这么做？实测（2026-09-22）模型问「304 测了哪些点」时，本能地会带 query 调一次，
+    #   拿到的却是一长串被截断的文件路径 → 于是**不得不再调一次不带 query 的总览**，
+    #   白烧一整轮模型往返（约 2～3 秒，占总耗时 20%）。把摘要一起给它，第一轮就够用。
+    q = str(query).strip().lower()
+    ov = spectrum_catalog.overview(DATA_ROOT)
+    hit_dirs = {g["dir"] for g in ov["groups"] if q in str(g["dir"]).lower()}
+    if hit_dirs:
+        res["matched_groups"] = [g for g in ov["groups"] if g["dir"] in hit_dirs]
+        res["matched_by_material"] = [
+            b for b in ov["by_material"] if hit_dirs.intersection(b["dirs"])
+        ]
+
     res["hint"] = (
-        f"只显示了 {res['n_returned']}/{res['n_matched']} 个（已截断）。"
+        f"只显示了 {res['n_returned']}/{res['n_matched']} 个文件路径（已截断）。"
+        "「有哪些数据 / 测了哪些点」看 matched_groups 就够了，**不必再调一次不带 query 的总览**。"
         "想读某一条，把它的 path 传给 load_spectrum_summary；想画图传给 plot_spectra。"
         if res["truncated"] else
-        f"共 {res['n_matched']} 个，全部已返回。"
+        f"共 {res['n_matched']} 个文件，全部已返回；"
+        "「有哪些数据 / 测了哪些点」看 matched_groups 即可。"
         "想读某一条，把它的 path 传给 load_spectrum_summary；想画图传给 plot_spectra。"
     )
     return res

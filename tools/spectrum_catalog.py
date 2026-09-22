@@ -97,6 +97,8 @@ def overview(data_root: str) -> dict[str, Any]:
             "n_files": m["n_data_files"],
             "grid": m["grid"]["shape"] if m["grid"] else None,
             "n_points": m["grid"]["n_points"] if m["grid"] else None,
+            "n_measured_points": m["grid"]["n_measured_points"] if m["grid"] else None,
+            "missing_points": m["grid"]["missing_points"] if m["grid"] else None,
             "shots_per_point": m["shots_per_point"],
             "n_measurement_rounds": m["n_stamps"],
         })
@@ -142,6 +144,7 @@ def list_materials(data_root: str) -> list[dict[str, Any]]:
             continue
 
         csvs, parsed, xs, ys, shots, stamps, tags = [], [], set(), set(), set(), set(), set()
+        pts: set[tuple[int, int]] = set()   # 实际有数据的 (x, y)，用来算缺测点
         for fn in sorted(os.listdir(d)):
             if not os.path.isfile(os.path.join(d, fn)):
                 continue
@@ -153,16 +156,25 @@ def list_materials(data_root: str) -> list[dict[str, Any]]:
             if info:
                 parsed.append(info)
                 xs.add(info["x"]); ys.add(info["y"])
+                pts.add((info["x"], info["y"]))
                 shots.add(info["shot"])
                 stamps.add(info["stamp"]); tags.add(info["tag"])
 
         grid = None
         if xs and ys:
+            xs_s, ys_s = sorted(xs), sorted(ys)
             grid = {
-                "x_values": sorted(xs),
-                "y_values": sorted(ys),
-                "shape": f"{len(xs)}×{len(ys)}",
-                "n_points": len(xs) * len(ys),
+                "x_values": xs_s,
+                "y_values": ys_s,
+                "shape": f"{len(xs_s)}×{len(ys_s)}",
+                "n_points": len(xs_s) * len(ys_s),      # 网格上的理论点数
+                "n_measured_points": len(pts),          # 实际有数据的点数
+                # 缺测点：文件名里的坐标这里本来就解析过了，所以是**零额外成本**算出来的。
+                # 放进总览的目的：让「XXX 测了哪些点 / 网格是什么样」**一轮就能答**，
+                # 不必再补一次 describe_material_grid（实测每省一轮模型往返 ≈ 2～4 秒）。
+                "missing_points": [
+                    [x, y] for x in xs_s for y in ys_s if (x, y) not in pts
+                ],
             }
 
         out.append({
