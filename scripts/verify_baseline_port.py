@@ -24,6 +24,8 @@ tools/preprocess.py 里的 `airPLS` 与 `Whittaker` 是从 `<LIBS 软件安装�
 用法（在 libs_agent 目录下）：
     .\.venv\Scripts\python.exe scripts\verify_baseline_port.py
 可选：用环境变量 REF_IMPL_ROOT 指定那套软件的目录。
+可选：用环境变量 LIBS_AGENT_ROOT 指定项目根 —— 从技能目录的副本里跑时用得上。
+（脚本会自己找项目根：环境变量 → 默认路径 → 脚本上一级，哪个合理用哪个。）
 """
 
 from __future__ import annotations
@@ -32,7 +34,25 @@ import importlib.util
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _find_project_root() -> str:
+    """定位项目根 —— 要兼容两种运行位置：
+
+    ① 在项目里跑（`scripts/verify_baseline_port.py`）→ 上一级就是项目根；
+    ② 从**别处的副本**里跑（例如维护技能目录下的那份）→ 上一级不是项目根，
+       得靠环境变量或默认路径找。
+
+    顺序：环境变量 → 默认项目路径 → 脚本上一级。
+    公开版的默认路径已被脱敏成占位符、必然不存在，于是自然退回脚本上一级，行为不变。
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for cand in (os.environ.get("LIBS_AGENT_ROOT"), r"<项目根目录>", here):
+        if cand and os.path.isdir(os.path.join(cand, "tools")):
+            return cand
+    return here
+
+
+ROOT = _find_project_root()
 sys.path.insert(0, ROOT)
 
 import numpy as np  # noqa: E402
